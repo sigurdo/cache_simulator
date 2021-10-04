@@ -25,10 +25,26 @@ typedef struct {
 // DECLARE CACHES AND COUNTERS FOR THE STATS HERE
 
 
-uint32_t cache_size; 
+uint32_t cache_size;
 uint32_t block_size = 64;
 cache_map_t cache_mapping;
 cache_org_t cache_org;
+
+// Derivated parameters:
+uint32_t cache_size_single;
+uint32_t number_of_blocks;
+uint32_t num_bits_block_offset;
+uint32_t num_bits_index;
+uint32_t num_bits_tag;
+
+// Bit masks and shifts:
+uint32_t block_offset_mask;
+uint32_t index_mask;
+uint32_t tag_mask;
+
+// Pointers to actual cache
+uint32_t *cache_ptr;
+uint32_t *tags_ptr;
 
 // USE THIS FOR YOUR CACHE STATISTICS
 cache_stat_t cache_statistics;
@@ -69,6 +85,18 @@ mem_access_t read_transaction(FILE *ptr_file) {
      */
     access.address = 0;
     return access;
+}
+
+
+// Calculates floor(log_2(a))
+uint32_t log2_floor(uint32_t a) {
+    uint32_t b = 31;
+    if (a == 0) return 0xffffffff;
+    while (1) {
+        if ((a & 0x80000000) == 0x80000000) return b;
+        a = a << 1;
+        b--;
+    }
 }
 
 
@@ -115,12 +143,45 @@ void main(int argc, char** argv)
 
     /* Open the file mem_trace.txt to read memory accesses */
     FILE *ptr_file;
-    ptr_file =fopen("mem_trace.txt","r");
+    ptr_file =fopen("trace_files/trace_3.txt","r");
     if (!ptr_file) {
         printf("Unable to open the trace file\n");
         exit(1);
     }
 
+    // Calculate derivated parameters:
+    cache_size_single      = cache_org == uc ? cache_size : cache_size / 2;
+    number_of_blocks       = cache_size_single / block_size;
+    num_bits_block_offset  = log2_floor(block_size);
+    num_bits_index         = cache_mapping == dm ? log2_floor(number_of_blocks) : 0;
+    num_bits_tag           = 32 - num_bits_block_offset - num_bits_index;
+
+    // Calculate masks:
+    block_offset_mask = 0;
+    for (int i = 0; i < num_bits_block_offset; i++) block_offset_mask |= 1 << i;
+    index_mask = 0;
+    for (int i = num_bits_block_offset; i < num_bits_block_offset + num_bits_index; i++) index_mask |= 1 << i;
+    tag_mask = 0;
+    for (int i = num_bits_block_offset + num_bits_index; i < 32; i++) tag_mask |= 1 << i;
+
+    // Allocate memory for cache:
+    cache_ptr = malloc(cache_size);
+    tags_ptr = malloc(4 * number_of_blocks);
+
+    printf("Cache size:                      %d\n", cache_size);
+    printf("Block size:                      %d\n", block_size);
+    printf("Cache mapping:                   %s\n", cache_mapping == dm ? "dm" : "fa");
+    printf("Cache organization:              %s\n", cache_org == uc ? "uc" : "sc");
+    printf("Cache size single:               %d\n", cache_size_single);
+    printf("Number of blocks:                %d\n", number_of_blocks);
+    printf("Number of bits for block offset: %d\n", num_bits_block_offset);
+    printf("Number of bits for index:        %d\n", num_bits_index);
+    printf("Number of bits for tag:          %d\n", num_bits_tag);
+    printf("Block offset mask:               %x\n", block_offset_mask);
+    printf("Index mask:                      %x\n", index_mask);
+    printf("Tag mask:                        %x\n", tag_mask);
+    printf("Cache pointer:                   %lx\n", (uint64_t) cache_ptr);
+    printf("\n");
     
     /* Loop until whole trace file has been read */
     mem_access_t access;
@@ -129,9 +190,48 @@ void main(int argc, char** argv)
         //If no transactions left, break out of loop
         if (access.address == 0)
             break;
-	printf("%d %x\n",access.accesstype, access.address);
-	/* Do a cache access */
-	// ADD YOUR CODE HERE
+        printf("%d %x\n",access.accesstype, access.address);
+        /* Do a cache access */
+        // ADD YOUR CODE HERE
+
+        cache_statistics.accesses++;
+
+        switch (cache_org) {
+        case uc:
+            switch (cache_mapping) {
+            case dm:
+                // tag: access.address & tag_mask
+                // tag in cache: tags_ptr[(access.address & index_mask) >> num_bits_block_offset]
+                // if tag == tag in cache: there is a hit
+                if ((access.address & tag_mask) == tags_ptr[(access.address & index_mask) >> num_bits_block_offset]) {
+                    cache_statistics.hits++;
+                    printf("hit!\n");
+                }
+                // store tag in tags_ptr
+                tags_ptr[(access.address & index_mask) >> num_bits_block_offset] = (access.address & tag_mask);
+                break;
+            case fa:
+                for (int i = 0; i < number_of_blocks; i++) {
+                    // tag: access.address & tag_mask
+                    // tag in cache: tags_ptr[i]
+                    // if tag == tag in cache: there is a hit
+                    if ((access.address & tag_mask) == tags_ptr[i]) {
+                        cache_statistics.hits++;
+                        printf("hit!\n");
+                        break;
+                    }
+                }
+                // push tag to tags_ptr FIFO
+                for (int i = number_of_blocks - 2; i >= 0; i--) {
+                    tags_ptr[i + 1] = tags_ptr[i];
+                }
+                tags_ptr[0] = (access.address & tag_mask);
+                break;
+            }
+            break;
+        case sc:
+            break;
+        }
     }
 
     /* Print the statistics */
