@@ -46,6 +46,12 @@ uint32_t tag_mask;
 uint32_t *cache_ptr;
 uint32_t *tags_ptr;
 
+// Temp variables
+uint32_t accesstype_offset;
+uint32_t indexx;
+uint32_t tag;
+uint32_t hit;
+
 // USE THIS FOR YOUR CACHE STATISTICS
 cache_stat_t cache_statistics;
 
@@ -165,8 +171,15 @@ void main(int argc, char** argv)
     for (int i = num_bits_block_offset + num_bits_index; i < 32; i++) tag_mask |= 1 << i;
 
     // Allocate memory for cache:
-    cache_ptr = malloc(cache_size);
-    tags_ptr = malloc(4 * number_of_blocks);
+    // cache_ptr = malloc(cache_size);
+    switch (cache_org) {
+    case uc:
+        tags_ptr = malloc(4 * number_of_blocks);
+        break;
+    case sc:
+        tags_ptr = malloc(2 * 4 * number_of_blocks);
+        break;
+    }
 
     printf("Cache size:                      %d\n", cache_size);
     printf("Block size:                      %d\n", block_size);
@@ -181,6 +194,7 @@ void main(int argc, char** argv)
     printf("Index mask:                      %x\n", index_mask);
     printf("Tag mask:                        %x\n", tag_mask);
     printf("Cache pointer:                   %lx\n", (uint64_t) cache_ptr);
+    printf("Tags pointer:                    %lx\n", (uint64_t) tags_ptr);
     printf("\n");
     
     /* Loop until whole trace file has been read */
@@ -190,48 +204,49 @@ void main(int argc, char** argv)
         //If no transactions left, break out of loop
         if (access.address == 0)
             break;
-        printf("%d %x\n",access.accesstype, access.address);
+        // printf("%s %x\n", access.accesstype == instruction ? "I" : "D", access.address);
         /* Do a cache access */
         // ADD YOUR CODE HERE
 
         cache_statistics.accesses++;
+        
+        accesstype_offset = cache_org == uc ? 0 : (access.accesstype * number_of_blocks);
+        indexx = ((access.address & index_mask) >> num_bits_block_offset);
+        tag = (access.address & tag_mask); // >> (num_bits_index + number_of_blocks);
+        hit = 0;
 
-        switch (cache_org) {
-        case uc:
-            switch (cache_mapping) {
-            case dm:
-                // tag: access.address & tag_mask
-                // tag in cache: tags_ptr[(access.address & index_mask) >> num_bits_block_offset]
-                // if tag == tag in cache: there is a hit
-                if ((access.address & tag_mask) == tags_ptr[(access.address & index_mask) >> num_bits_block_offset]) {
-                    cache_statistics.hits++;
-                    printf("hit!\n");
-                }
-                // store tag in tags_ptr
-                tags_ptr[(access.address & index_mask) >> num_bits_block_offset] = (access.address & tag_mask);
-                break;
-            case fa:
-                for (int i = 0; i < number_of_blocks; i++) {
-                    // tag: access.address & tag_mask
-                    // tag in cache: tags_ptr[i]
-                    // if tag == tag in cache: there is a hit
-                    if ((access.address & tag_mask) == tags_ptr[i]) {
-                        cache_statistics.hits++;
-                        printf("hit!\n");
-                        break;
-                    }
-                }
-                // push tag to tags_ptr FIFO
-                for (int i = number_of_blocks - 2; i >= 0; i--) {
-                    tags_ptr[i + 1] = tags_ptr[i];
-                }
-                tags_ptr[0] = (access.address & tag_mask);
-                break;
+        switch (cache_mapping) {
+        case dm:
+            // tag: access.address & tag_mask
+            // tag in cache: tags_ptr[(access.address & index_mask) >> num_bits_block_offset]
+            // if tag == tag in cache: there is a hit
+            if (tag == tags_ptr[accesstype_offset + indexx]) {
+                cache_statistics.hits++;
+                hit = 1;
             }
+            // store tag in tags_ptr
+            tags_ptr[accesstype_offset + indexx] = tag;
             break;
-        case sc:
+        case fa:
+            for (int i = 0; i < number_of_blocks; i++) {
+                // tag: access.address & tag_mask
+                // tag in cache: tags_ptr[i]
+                // if tag == tag in cache: there is a hit
+                if (tag == tags_ptr[accesstype_offset + i]) {
+                    cache_statistics.hits++;
+                    hit = 1;
+                    break;
+                }
+            }
+            // push tag to tags_ptr FIFO
+            for (int i = number_of_blocks - 2; i >= 0; i--) {
+                tags_ptr[accesstype_offset + i + 1] = tags_ptr[accesstype_offset + i];
+            }
+            tags_ptr[accesstype_offset + 0] = tag;
             break;
         }
+
+        printf("%s %x | %s\n", access.accesstype == instruction ? "I" : "D", access.address, hit ? "hit" : "miss");
     }
 
     /* Print the statistics */
