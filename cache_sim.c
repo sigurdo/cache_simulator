@@ -4,6 +4,8 @@
 #include <assert.h>
 #include <inttypes.h>
 
+#define BLOCK_SIZE 64
+
 typedef enum {dm, fa} cache_map_t;
 typedef enum {uc, sc} cache_org_t;
 typedef enum {instruction, data} access_t;
@@ -21,18 +23,25 @@ typedef struct {
     // remove the accesses or hits
 } cache_stat_t;
 
+typedef struct {
+    uint8_t valid;
+    uint32_t tag;
+    uint32_t entries[BLOCK_SIZE]; // This is by no means necessary, just a waste of memory allocation, but I think its nice to have a place that the cache entries actually can be stored.
+} cache_block_t;
+
 
 // DECLARE CACHES AND COUNTERS FOR THE STATS HERE
 
 
 uint32_t cache_size;
-uint32_t block_size = 64;
+uint32_t block_size = BLOCK_SIZE;
 cache_map_t cache_mapping;
 cache_org_t cache_org;
 
 // Derivated parameters:
 uint32_t cache_size_single;
 uint32_t number_of_blocks;
+uint32_t number_of_blocks_single;
 uint32_t num_bits_block_offset;
 uint32_t num_bits_index;
 uint32_t num_bits_tag;
@@ -43,11 +52,12 @@ uint32_t index_mask;
 uint32_t tag_mask;
 
 // Pointers to actual cache
-uint32_t *cache_ptr;
-uint32_t *tags_ptr;
+cache_block_t *cache_ptr;
+uint32_t cache_fifo_index[2]; // Current indexes for next slot to overwrite when pushing to the cache fifo (only used in FA). This is an array because it is one index for the instruction cache and one index for the data cache.
 
 // Temp variables
 uint32_t accesstype_offset;
+uint32_t accesstype_offset_fifo_index;
 uint32_t indexx;
 uint32_t tag;
 uint32_t hit;
@@ -149,18 +159,19 @@ void main(int argc, char** argv)
 
     /* Open the file mem_trace.txt to read memory accesses */
     FILE *ptr_file;
-    ptr_file =fopen("trace_files/trace_3.txt","r");
+    ptr_file =fopen("trace_files/trace_2.txt","r");
     if (!ptr_file) {
         printf("Unable to open the trace file\n");
         exit(1);
     }
 
     // Calculate derivated parameters:
-    cache_size_single      = cache_org == uc ? cache_size : cache_size / 2;
-    number_of_blocks       = cache_size_single / block_size;
-    num_bits_block_offset  = log2_floor(block_size);
-    num_bits_index         = cache_mapping == dm ? log2_floor(number_of_blocks) : 0;
-    num_bits_tag           = 32 - num_bits_block_offset - num_bits_index;
+    cache_size_single       = cache_org == uc ? cache_size : cache_size / 2;
+    number_of_blocks        = cache_size / block_size;
+    number_of_blocks_single = cache_size_single / block_size;
+    num_bits_block_offset   = log2_floor(block_size);
+    num_bits_index          = cache_mapping == dm ? log2_floor(number_of_blocks_single) : 0;
+    num_bits_tag            = 32 - num_bits_block_offset - num_bits_index;
 
     // Calculate masks:
     block_offset_mask = 0;
@@ -171,15 +182,17 @@ void main(int argc, char** argv)
     for (int i = num_bits_block_offset + num_bits_index; i < 32; i++) tag_mask |= 1 << i;
 
     // Allocate memory for cache:
-    // cache_ptr = malloc(cache_size);
-    switch (cache_org) {
-    case uc:
-        tags_ptr = malloc(4 * number_of_blocks);
-        break;
-    case sc:
-        tags_ptr = malloc(2 * 4 * number_of_blocks);
-        break;
+    cache_ptr = malloc(sizeof(cache_block_t) * number_of_blocks);
+
+    // Initialize indexes for cache FIFO
+    for (int i = 0; i < 2; i++)
+        cache_fifo_index[i] = 0;
+
+    // Set valid = 0 everywhere
+    for (int i = 0; i < number_of_blocks; i++) {
+        cache_ptr[i].valid = 0;
     }
+
 
     printf("Cache size:                      %d\n", cache_size);
     printf("Block size:                      %d\n", block_size);
@@ -187,6 +200,7 @@ void main(int argc, char** argv)
     printf("Cache organization:              %s\n", cache_org == uc ? "uc" : "sc");
     printf("Cache size single:               %d\n", cache_size_single);
     printf("Number of blocks:                %d\n", number_of_blocks);
+    printf("Number of blocks single:         %d\n", number_of_blocks_single);
     printf("Number of bits for block offset: %d\n", num_bits_block_offset);
     printf("Number of bits for index:        %d\n", num_bits_index);
     printf("Number of bits for tag:          %d\n", num_bits_tag);
@@ -194,7 +208,7 @@ void main(int argc, char** argv)
     printf("Index mask:                      %x\n", index_mask);
     printf("Tag mask:                        %x\n", tag_mask);
     printf("Cache pointer:                   %lx\n", (uint64_t) cache_ptr);
-    printf("Tags pointer:                    %lx\n", (uint64_t) tags_ptr);
+    // printf("Tags pointer:                    %lx\n", (uint64_t) tags_ptr);
     printf("\n");
     
     /* Loop until whole trace file has been read */
@@ -210,9 +224,10 @@ void main(int argc, char** argv)
 
         cache_statistics.accesses++;
         
-        accesstype_offset = cache_org == uc ? 0 : (access.accesstype * number_of_blocks);
+        accesstype_offset = cache_org == uc ? 0 : (access.accesstype * number_of_blocks_single);
+        accesstype_offset_fifo_index = cache_org == uc ? 0 : access.accesstype;
         indexx = ((access.address & index_mask) >> num_bits_block_offset);
-        tag = (access.address & tag_mask); // >> (num_bits_index + number_of_blocks);
+        tag = (access.address & tag_mask); // >> (num_bits_index + number_of_blocks_single);
         hit = 0;
 
         switch (cache_mapping) {
@@ -220,34 +235,39 @@ void main(int argc, char** argv)
             // tag: access.address & tag_mask
             // tag in cache: tags_ptr[(access.address & index_mask) >> num_bits_block_offset]
             // if tag == tag in cache: there is a hit
-            if (tag == tags_ptr[accesstype_offset + indexx]) {
+            if (cache_ptr[accesstype_offset + indexx].valid && (tag == cache_ptr[accesstype_offset + indexx].tag)) {
                 cache_statistics.hits++;
                 hit = 1;
             }
-            // store tag in tags_ptr
-            tags_ptr[accesstype_offset + indexx] = tag;
+            // store tag in cache
+            cache_ptr[accesstype_offset + indexx].tag = tag;
+            cache_ptr[accesstype_offset + indexx].valid = 1;
             break;
         case fa:
-            for (int i = 0; i < number_of_blocks; i++) {
+            for (int i = 0; i < number_of_blocks_single; i++) {
                 // tag: access.address & tag_mask
                 // tag in cache: tags_ptr[i]
                 // if tag == tag in cache: there is a hit
-                if (tag == tags_ptr[accesstype_offset + i]) {
+                if (cache_ptr[accesstype_offset + i].valid && (tag == cache_ptr[accesstype_offset + i].tag)) {
                     cache_statistics.hits++;
                     hit = 1;
                     break;
                 }
             }
-            // push tag to tags_ptr FIFO
-            for (int i = number_of_blocks - 2; i >= 0; i--) {
-                tags_ptr[accesstype_offset + i + 1] = tags_ptr[accesstype_offset + i];
+            if (!hit) {
+                // push tag to cache FIFO
+                cache_ptr[accesstype_offset + cache_fifo_index[accesstype_offset_fifo_index]].tag = tag;
+                cache_ptr[accesstype_offset + cache_fifo_index[accesstype_offset_fifo_index]].valid = 1;
+                // update cache FIFO index
+                cache_fifo_index[accesstype_offset_fifo_index] = (cache_fifo_index[accesstype_offset_fifo_index] + 1) % number_of_blocks_single;
             }
-            tags_ptr[accesstype_offset + 0] = tag;
             break;
         }
 
-        printf("%s %x | %s\n", access.accesstype == instruction ? "I" : "D", access.address, hit ? "hit" : "miss");
+        // printf("%s %x | %s\n", access.accesstype == instruction ? "I" : "D", access.address, hit ? "hit" : "miss");
     }
+
+    free(cache_ptr);
 
     /* Print the statistics */
     // DO NOT CHANGE THE FOLLOWING LINES!
